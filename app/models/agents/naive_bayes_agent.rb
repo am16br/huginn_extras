@@ -1,0 +1,149 @@
+#require 'nbayes'
+#require 'yaml'
+#require 'fast_stemmer'
+
+module Agents
+  class NaiveBayesAgent < Agent
+    cannot_be_scheduled!
+    can_dry_run!
+
+    description <<-MD
+      The Naive Bayes Agent uses incoming Events from certain sources as a training set for Naive Bayes Machine Learning. Then it classifies Events from other sources and adds category tags to them accordingly.
+
+      All incoming events should have these two fields in their payloads, likely via the Event Formatting or Javascript Agent:
+
+        * `nb_content` for the content used for classification, space separated.
+        * `nb_cats` for the classification categories, space separated.
+
+      If `nb_cats` is empty or contains `=class`, then the content from `nb_content` will be classified according to the training data. The categories will be added to `nb_cats` and then a new event is created with that payload.
+
+      However, if `nb_cats` is already populated, then the content from `nb_content` will be used as training data for the categories listed in `nb_cats`. For instance, say `nb_cats` consists of `trees`. Then `nb_content` will be used as training data for the category `trees`. The data is saved to the agent memory.
+
+      Data in `nb_content` can be cleaned before classification. If `strip_punctuation` is set to true, the text in `nb_content` is stripped of punctuation before it is sent to the classifier. The changes are not saved to `nb_content` but will affect the Agent's saved training data.
+
+      Content can also be "stemmed", reducing words to their base, by setting `stem` to true. Stemming will reduce "epistemology", "epistemologies", and "epistemological" all to "epistemolog". See [here](https://github.com/romanbsd/fast-stemmer) for the implementation used. Again, changes are not saved to `nb_content` but will affect the Agent's saved training data.
+
+      When an event is received for classification, the Naive Bayes Agent will assign a value between 0 and 1 representing the likelihood that it falls under a category. The `min_value` option lets you choose the minimum threshold that must be reached before the event is labeled with that category. If `min_value` is set to 1, then the event is labeled with whichever category has the highest value.
+
+      The option `propagate_training_events` lets you choose whether the training events are emitted along with the classified events. If it is set to false, then no new event will be created from events that already had categories when they were received.
+
+      To load trained data into an agent's memory, create a Manual Agent with `nb_cats : =loadYML` and `nb_content : your-well-formed-training-data-here`. Use the text input box, not the form view, by clicking "Toggle View" when inputting your training data else whitespace errors occur in the YML. Then submit this to your Naive Bayes Agent.
+
+      #### Advanced Naive Bayes Features
+
+      ##### Only works if the nbayes dependency was installed from Github, version => .1.2. Rubygems is still .1.1
+
+      *Be carefull with these functions: see the documentation linked below.*
+
+      If a category has a `-` in front of it, eg. `-trees`, then the category `trees` will be UNtrained according to that content.
+
+      Low frequency words that increase processing time and may overfit - tokens with a count less than x (measured by summing across all classes) - can be removed: Set `nb_cats : =purgeTokens` and `nb_content : integer-value`.
+
+      Categories can be similarly deleted by `nb_cats : =delCat` and `nb_content : categories to delete`.
+
+      **See [the NBayes ruby gem](https://github.com/oasic/nbayes) and [this blog post](http://blog.oasic.net/2012/06/naive-bayes-for-ruby.html) for more information about the Naive Bayes implementation used here.**
+    MD
+
+    def default_options
+      {
+        'min_value' => "0.5",
+        'propagate_training_events' => 'true',
+        'expected_update_period_in_days' => "7",
+        'strip_punctuation' => 'false',
+        'stem' => 'false'
+      }
+    end
+
+    def validate_options
+      errors.add(:base, "expected_update_period_in_days must be present") unless options['expected_update_period_in_days'].present?
+      errors.add(:base, "minimum value must be greater than 0 and less than or equal to 1, e.g. 0.5") unless (0 < options['min_value'].to_f && options['min_value'].to_f <= 1)
+    end
+
+    def working?
+      received_event_without_error?
+    end
+
+    def receive(incoming_events)
+      incoming_events.each do |event|
+        nbayes = load(memory['data'])
+        # validate incoming payload
+        if !event.payload['nb_cats']
+          error("Missing `nb_cats` field in the event payload. #{event.payload.to_s}")
+		  raise 'Missing `nb_cats` field in the event payload.'
+        end
+        if !event.payload['nb_content']
+          error("Missing `nb_content` field in the event payload. #{event.payload.to_s}")
+          raise 'Missing `nb_content` field in the event payload.'
+        end
+        # train or modify existing classifier
+        if event.payload['nb_cats'].length > 0 and not event.payload['nb_cats'].include?("=class")
+          cats = event.payload['nb_cats'].split(/\s+/)
+          if cats[0] == "=loadYML"
+            memory['data'] = event.payload['nb_content']
+          elsif cats[0] == "=delCat"
+            ca = event.payload['nb_content'].split(/\s+/)
+            ca.each do |c|
+              nbayes.delete_category(c)
+            end
+            memory['data'] = YAML.dump(nbayes)
+          elsif cats[0] == "=purgeTokens"
+            nbayes.purge_less_than(event.payload['nb_content'].to_i)
+            memory['data'] = YAML.dump(nbayes)
+          else
+            nb_content = event.payload['nb_content']
+            if interpolated['strip_punctuation'] == "true"
+              nb_content = nb_content.gsub(/[^[:word:]\s]/, '') #https://stackoverflow.com/a/10074271
+            end
+            if interpolated['stem'] == "true"
+              nb_content = nb_content.split(/\s+/).map{|word| word.stem}.join(" ")
+            end
+            cats.each do |c|
+              c.starts_with?('-') ? nbayes.untrain(nb_content.split(/\s+/), c[1..-1]) : nbayes.train(nb_content.split(/\s+/), c)
+            end
+            memory['data'] = YAML.dump(nbayes)
+            if interpolated['propagate_training_events'] == "true"
+              create_event payload: event.payload
+            end
+          end
+        # classify new data
+        else
+          nb_content = event.payload['nb_content']
+          if interpolated['strip_punctuation'] == "true"
+            nb_content = nb_content.gsub(/[^[:word:]\s]/, '') #https://stackoverflow.com/a/10074271
+          end
+          if interpolated['stem'] == "true"
+            nb_content = nb_content.split(/\s+/).map{|word| word.stem}.join(" ")
+          end
+          result = nbayes.classify(nb_content.split(/\s+/))
+          if interpolated['min_value'].to_f == 1
+            event.payload['nb_cats'] << (event.payload['nb_cats'].length == 0 ? result.max_class : " "+result.max_class)
+          else
+            result.each do |cat, val|
+              if val > interpolated['min_value'].to_f
+                event.payload['nb_cats'] << (event.payload['nb_cats'].length == 0 ? cat : " "+cat)
+              end
+            end
+          end
+          create_event payload: event.payload
+        end
+      end
+    end
+
+    def load(dat)
+      if dat.nil?
+        nbayes = NBayes::Base.new
+      else
+        nbayes = self.class.from_yml(dat)
+      end
+      nbayes
+    end
+
+
+    def self.from_yml(yml_data)
+      nbayes = YAML.load(yml_data)
+      nbayes.reset_after_import()  # yaml does not properly set the defaults on the Hashes
+      nbayes
+    end
+
+  end
+end
